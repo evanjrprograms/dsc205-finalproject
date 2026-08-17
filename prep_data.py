@@ -21,6 +21,7 @@ Everything else downloads itself.
 """
 
 import json
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -51,10 +52,6 @@ GEOJSON_URL = (
 
 # Population and median household income, 5-year ACS.
 ACS_YEAR = 2023
-ACS_URL = (
-    f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
-    "?get=NAME,B01003_001E,B19013_001E&for=county:*&in=state:*"
-)
 
 # The six official EPA health categories. Everything in the app colours by
 # these, and the boundaries never change no matter what is filtered.
@@ -203,37 +200,127 @@ def get_geojson():
     return geo
 
 
+def fetch_acs():
+    """Population and median income from the Census API.
+
+    The Census API is fussy: a given ACS year may not be published yet, and it
+    sometimes rejects the default requests user-agent. So we try a few
+    variations and give up gracefully rather than crashing - population and
+    income are only needed for the "who is exposed" question, and the map,
+    seasonality and trend charts work fine without them.
+
+    Returns a DataFrame, or None if every attempt failed.
+    """
+    fields = "NAME,B01003_001E,B19013_001E"
+
+    # The Census API requires a free key. Get one in about a minute at
+    # https://api.census.gov/data/key_signup.html (remember to click the
+    # activation link in the email), then set it before running:
+    #     export CENSUS_API_KEY=your_key_here      (Mac/Linux terminal)
+    #     %env CENSUS_API_KEY=your_key_here        (Colab / Jupyter cell)
+    # It is read from the environment on purpose, so the key never gets
+    # committed to a public repo.
+    key = os.environ.get("CENSUS_API_KEY", "").strip()
+    suffix = f"&key={key}" if key else ""
+
+    if not key:
+        log("    no CENSUS_API_KEY set - the API will refuse the request")
+
+    attempts = [
+        (f"ACS {ACS_YEAR}",
+         f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
+         f"?get={fields}&for=county:*&in=state:*{suffix}"),
+        (f"ACS {ACS_YEAR}, no state clause",
+         f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
+         f"?get={fields}&for=county:*{suffix}"),
+        (f"ACS {ACS_YEAR - 1}",
+         f"https://api.census.gov/data/{ACS_YEAR - 1}/acs/acs5"
+         f"?get={fields}&for=county:*{suffix}"),
+        (f"ACS {ACS_YEAR - 2}",
+         f"https://api.census.gov/data/{ACS_YEAR - 2}/acs/acs5"
+         f"?get={fields}&for=county:*{suffix}"),
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (DSC205 student project)"}
+
+    for label, url in attempts:
+        try:
+            r = requests.get(url, timeout=120, headers=headers)
+        except Exception as e:
+            log(f"    {label}: request failed ({type(e).__name__})")
+            continue
+
+        if r.status_code != 200:
+            log(f"    {label}: HTTP {r.status_code}")
+            continue
+
+        # The Census API returns its error pages as HTML with status 200, so
+        # the status code alone does not tell us whether this worked.
+        if r.text.lstrip()[:1] == "<":
+            if "missing key" in r.text.lower():
+                log(f"    {label}: rejected - CENSUS_API_KEY is missing or "
+                    f"not yet activated")
+            elif "invalid key" in r.text.lower():
+                log(f"    {label}: rejected - CENSUS_API_KEY is not valid")
+            else:
+                log(f"    {label}: got an HTML error page, not data")
+            continue
+
+        try:
+            rows = r.json()
+        except Exception:
+            # Not JSON - show what actually came back so it can be diagnosed.
+            log(f"    {label}: response was not JSON -> {r.text[:120]!r}")
+            continue
+
+        acs = pd.DataFrame(rows[1:], columns=rows[0])
+        acs["fips"] = acs["state"].str.zfill(2) + acs["county"].str.zfill(3)
+        acs["population"] = pd.to_numeric(acs["B01003_001E"], errors="coerce")
+        acs["median_income"] = pd.to_numeric(acs["B19013_001E"], errors="coerce")
+
+        # The Census API uses large negative numbers as "no estimate available".
+        acs.loc[acs["population"] < 0, "population"] = pd.NA
+        acs.loc[acs["median_income"] < 0, "median_income"] = pd.NA
+
+        acs = acs[["fips", "population", "median_income"]]
+        acs = acs[~acs["fips"].str[:2].isin(DROP_STATE_CODES)]
+        log(f"    {label}: OK, {len(acs):,} counties")
+        return acs
+
+    return None
+
+
 def get_county_meta(geo):
-    """Population, income and land area for every county."""
-    log("  population + income: downloading from Census API...")
-    rows = requests.get(ACS_URL, timeout=120).json()
-    acs = pd.DataFrame(rows[1:], columns=rows[0])
-
-    acs["fips"] = acs["state"].str.zfill(2) + acs["county"].str.zfill(3)
-    acs["population"] = pd.to_numeric(acs["B01003_001E"], errors="coerce")
-    acs["median_income"] = pd.to_numeric(acs["B19013_001E"], errors="coerce")
-
-    # The Census API uses -666666666 as a "no estimate available" marker.
-    acs.loc[acs["median_income"] < 0, "median_income"] = pd.NA
-
-    acs = acs[["fips", "population", "median_income"]]
-    acs = acs[~acs["fips"].str[:2].isin(DROP_STATE_CODES)]
-
-    # Land area rides along in the shape file, so no extra download.
-    area = pd.DataFrame([
+    """County name, land area, division, and (if available) population/income."""
+    # Land area and county names ride along in the shape file - no download.
+    meta = pd.DataFrame([
         {"fips": f["id"],
          "county_name": f["properties"]["NAME"],
          "land_area_sqmi": f["properties"].get("CENSUSAREA")}
         for f in geo["features"]
     ])
 
-    meta = area.merge(acs, on="fips", how="left")
+    log("  population + income: downloading from Census API...")
+    acs = fetch_acs()
+
+    if acs is None:
+        log("  ! Census API unavailable. Continuing WITHOUT population and")
+        log("    income. The map, seasonality and trend charts will all work;")
+        log("    the 'who is exposed' equity question will not.")
+        meta["population"] = pd.NA
+        meta["median_income"] = pd.NA
+    else:
+        meta = meta.merge(acs, on="fips", how="left")
+
     meta["division"] = meta["fips"].str[:2].map(DIVISION)
     meta["region"] = meta["division"].map(REGION)
-    meta["density"] = (meta["population"] / meta["land_area_sqmi"]).round(1)
+    meta["density"] = (
+        pd.to_numeric(meta["population"], errors="coerce")
+        / pd.to_numeric(meta["land_area_sqmi"], errors="coerce")
+    ).round(1)
 
-    log(f"  population + income: {len(meta):,} counties "
-        f"({meta['population'].isna().sum():,} missing population)")
+    log(f"  county details: {len(meta):,} counties "
+        f"({pd.to_numeric(meta['population'], errors='coerce').isna().sum():,} "
+        f"missing population)")
     return meta
 
 
