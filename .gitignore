@@ -220,3 +220,8 @@ data/raw/*.zip
 data/raw/*.csv
 __pycache__/
 .DS_Store
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+.env
