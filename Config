@@ -1,0 +1,15 @@
+[theme]
+# Pinned so the app looks the same for everyone, including on a projector.
+# Without this, Streamlit follows each viewer's light/dark preference and the
+# map's no-data grey stops reading as "no data".
+base = "light"
+primaryColor = "#E8833A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F7"
+textColor = "#0F3A4D"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
