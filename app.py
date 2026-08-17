@@ -12,6 +12,7 @@ what keeps it responsive.
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -123,17 +124,29 @@ def load_daily(year):
     return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
-def quiet_layout(fig, height=460):
-    """Shared chart styling, so every panel looks like it belongs to the app."""
+def quiet_layout(fig, height=460, has_legend=True):
+    """Shared chart styling, so every panel looks like it belongs to the app.
+
+    The legend sits BELOW the plot. Putting it above puts it in the same band
+    as the title, and the two overlap as soon as either one gets long.
+    """
     fig.update_layout(
         height=height,
-        margin=dict(l=10, r=10, t=48, b=10),
+        margin=dict(l=10, r=10, t=64, b=86 if has_legend else 24),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(size=13),
-        title_font=dict(size=17),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        title=dict(font=dict(size=17), x=0, xanchor="left",
+                   y=0.97, yanchor="top"),
+        showlegend=has_legend,
     )
+    if has_legend:
+        fig.update_layout(legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.16,
+            xanchor="left", x=0,
+            title_text="",
+        ))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(128,128,128,0.18)")
     return fig
@@ -189,9 +202,10 @@ def build_map(df, geo, metric):
         subunitcolor="rgba(255,255,255,0.25)",
     )
     fig.update_layout(
-        title=title,
+        title=dict(text=title, font=dict(size=17), x=0, xanchor="left",
+                   y=0.97, yanchor="top"),
         height=520,
-        margin=dict(l=0, r=0, t=48, b=0),
+        margin=dict(l=0, r=0, t=60, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         geo=dict(bgcolor="rgba(0,0,0,0)"),
     )
@@ -207,7 +221,7 @@ def build_ranked_bars(df, metric, n=15):
     )
     fig.update_traces(marker_color=AMBER, textposition="outside", cliponaxis=False)
     fig.update_layout(title=f"Worst {n} counties")
-    return quiet_layout(fig, height=520)
+    return quiet_layout(fig, height=520, has_legend=False)
 
 
 def build_county_trend(annual, fips, metric):
@@ -254,7 +268,7 @@ def build_seasonality(rm, year):
     )
     fig.update_layout(title=f"Median AQI by month and region, {year}",
                       xaxis_title="", yaxis_title="")
-    return quiet_layout(fig, height=440)
+    return quiet_layout(fig, height=440, has_legend=False)
 
 
 def build_slope(annual, first, last, metric, n=12):
@@ -288,7 +302,7 @@ def build_slope(annual, first, last, metric, n=12):
               f"(teal = improved, orange = got worse)",
         yaxis_title=label,
     )
-    return quiet_layout(fig, height=480), show
+    return quiet_layout(fig, height=480, has_legend=False), show
 
 
 def build_mix(mix):
@@ -306,10 +320,16 @@ def build_mix(mix):
 
 
 def build_equity(df, metric):
-    """Are counties with worse air poorer? Association, not cause."""
+    """Are counties with worse air poorer? Association, not cause.
+
+    The fit line is worked out here with numpy rather than handed to Plotly's
+    built-in trendline, which needs statsmodels. One less dependency, and one
+    less thing that can break on a version mismatch during a live demo.
+    """
     sub = df.dropna(subset=["median_income", metric, "population"])
     if sub.empty or len(sub) < 10:
-        return None
+        return None, None
+
     fig = px.scatter(
         sub, x="median_income", y=metric,
         size="population", size_max=38, color="region",
@@ -319,20 +339,27 @@ def build_equity(df, metric):
             metric: "Days above 100" if metric == "unhealthy_days" else "Median AQI",
             "region": "Region",
         },
-        trendline="ols" if _has_statsmodels() else None,
-        trendline_color_override="#5F7480",
-        trendline_scope="overall" if _has_statsmodels() else None,
     )
+
+    # Least-squares line through the points, plus how strong the relationship is.
+    x = sub["median_income"].astype(float).to_numpy()
+    y = sub[metric].astype(float).to_numpy()
+    stats = None
+    if len(x) >= 3 and x.std() > 0 and y.std() > 0:
+        slope, intercept = np.polyfit(x, y, 1)
+        r = float(np.corrcoef(x, y)[0, 1])
+        xs = np.array([x.min(), x.max()])
+        fig.add_trace(go.Scatter(
+            x=xs, y=slope * xs + intercept, mode="lines",
+            name="Overall trend",
+            line=dict(color="#5F7480", width=2.5, dash="dash"),
+            hoverinfo="skip",
+        ))
+        # Change in the metric per $10,000 of income.
+        stats = {"slope_per_10k": slope * 10_000, "r": r, "n": len(x)}
+
     fig.update_layout(title="Income against air quality  ·  bubble size = population")
-    return quiet_layout(fig, height=520)
-
-
-def _has_statsmodels():
-    try:
-        import statsmodels  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return quiet_layout(fig, height=520), stats
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +551,7 @@ def main():
             "**The question:** are the counties with the worst air also the "
             "poorer ones?"
         )
-        fig = build_equity(view, metric)
+        fig, stats = build_equity(view, metric)
         if fig is None:
             st.info(
                 "Income data is not available in this build, so this panel "
@@ -533,6 +560,16 @@ def main():
             )
         else:
             st.plotly_chart(fig, width="stretch")
+            if stats:
+                unit = ("days above 100" if metric == "unhealthy_days"
+                        else "points of median AQI")
+                direction = "fewer" if stats["slope_per_10k"] < 0 else "more"
+                st.markdown(
+                    f"Across **{stats['n']:,} counties** in {year}, each extra "
+                    f"$10,000 of median household income goes with "
+                    f"**{abs(stats['slope_per_10k']):.1f} {direction} {unit}** "
+                    f"(correlation r = {stats['r']:.2f})."
+                )
             st.warning(
                 "This is an association, not a cause. Poorer counties are also "
                 "more likely to sit near ports, highways and industry, and this "
